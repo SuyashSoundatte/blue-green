@@ -1,0 +1,155 @@
+
+name: Deploy Node.js Application
+
+on:
+  push:
+    branches:
+      - main
+
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to Linux via Cloudflare SSH
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install cloudflared
+        shell: bash
+        run: |
+          curl -fsSL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o cloudflared
+
+          chmod +x cloudflared
+          sudo install cloudflared /usr/local/bin/cloudflared
+
+      - name: Configure SSH
+        shell: bash
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Deploy through Cloudflare Tunnel
+        shell: bash
+        env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+          SSH_USER: ${{ secrets.SSH_USER }}
+          SSH_HOST: ${{ secrets.SSH_HOST }}
+
+        run: |
+          set -Eeuo pipefail
+
+          echo "Starting Cloudflare Access TCP proxy..."
+
+          cloudflared access tcp \
+            --hostname "$SSH_HOST" \
+            --url 127.0.0.1:2222 \
+            --service-token-id "$CF_ACCESS_CLIENT_ID" \
+            --service-token-secret "$CF_ACCESS_CLIENT_SECRET" \
+            > /tmp/cloudflared.log 2>&1 &
+
+          CLOUDFLARED_PID=$!
+
+          cleanup() {
+            kill "$CLOUDFLARED_PID" 2>/dev/null || true
+          }
+
+          trap cleanup EXIT
+
+          echo "Waiting for Cloudflare proxy..."
+
+          for i in $(seq 1 30); do
+            if nc -z 127.0.0.1 2222 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+
+          if ! nc -z 127.0.0.1 2222; then
+            echo "Cloudflare proxy failed to start"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+          echo "Connecting to deployment server..."
+
+          ssh \
+            -i ~/.ssh/deploy_key \
+            -p 2222 \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -o ConnectTimeout=15 \
+            "$SSH_USER@127.0.0.1" \
+            'bash -s -l' <<'REMOTE'
+
+          set -Eeuo pipefail
+
+          APP_DIR="/media/hdd/projects/deploy"
+          BRANCH="main"
+          APP_NAME="deploy-app"
+
+          echo "================================"
+          echo "Starting deployment"
+          echo "================================"
+
+          cd "$APP_DIR"
+
+          echo "Fetching latest source..."
+          git fetch origin "$BRANCH"
+
+          echo "Updating working directory..."
+          git reset --hard "origin/$BRANCH"
+
+          echo "Installing production dependencies..."
+          npm ci --omit=dev
+
+          echo "Checking PM2 process..."
+
+          if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
+            echo "Restarting existing application..."
+            pm2 restart "$APP_NAME" --update-env
+          else
+            echo "Starting new application..."
+            pm2 start server.js --name "$APP_NAME"
+          fi
+
+          echo "Saving PM2 process list..."
+          pm2 save
+
+          echo "Verifying application status..."
+
+          node -e '
+            const apps = JSON.parse(require("child_process").execSync("pm2 jlist"));
+            const app = apps.find(p => p.name === "deploy-app");
+
+            if (!app || app.pm2_env.status !== "online") {
+              console.error("Deployment verification failed");
+              process.exit(1);
+            }
+
+            console.log("Application status:", app.pm2_env.status);
+          '
+
+          echo "================================"
+          echo "Deployment successful"
+          echo "================================"
+
+          REMOTE
