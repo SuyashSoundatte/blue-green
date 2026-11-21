@@ -1,11 +1,9 @@
-
 name: Deploy Node.js Application
 
 on:
   push:
     branches:
       - main
-
   workflow_dispatch:
 
 permissions:
@@ -19,6 +17,7 @@ jobs:
   deploy:
     name: Deploy to Linux via Cloudflare SSH
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Install cloudflared
@@ -27,13 +26,11 @@ jobs:
           curl -fsSL \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
             -o cloudflared
-
           chmod +x cloudflared
           sudo install cloudflared /usr/local/bin/cloudflared
 
       - name: Check cloudflared version
-        run: | 
-          cloudflared --version   
+        run: cloudflared --version
 
       - name: Configure SSH
         shell: bash
@@ -43,10 +40,8 @@ jobs:
         run: |
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-
           printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
           chmod 600 ~/.ssh/deploy_key
-
           printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
@@ -57,12 +52,10 @@ jobs:
           CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           SSH_USER: ${{ secrets.SSH_USER }}
           SSH_HOST: ${{ secrets.SSH_HOST }}
-
         run: |
           set -Eeuo pipefail
 
           echo "Starting Cloudflare Access TCP proxy..."
-
           cloudflared access tcp \
             --loglevel debug \
             --hostname "$SSH_HOST" \
@@ -70,92 +63,77 @@ jobs:
             --service-token-id "$CF_ACCESS_CLIENT_ID" \
             --service-token-secret "$CF_ACCESS_CLIENT_SECRET" \
             > /tmp/cloudflared.log 2>&1 &
-
           CLOUDFLARED_PID=$!
 
-          cleanup() {
-            kill "$CLOUDFLARED_PID" 2>/dev/null || true
-          }
-
+          cleanup() { kill "$CLOUDFLARED_PID" 2>/dev/null || true; }
           trap cleanup EXIT
 
+          wait_for_port() {
+            for i in $(seq 1 30); do
+              if (exec 3<>/dev/tcp/127.0.0.1/2222) 2>/dev/null; then
+                exec 3>&-
+                return 0
+              fi
+              sleep 1
+            done
+            return 1
+          }
+
           echo "Waiting for Cloudflare proxy..."
-
-          for i in $(seq 1 30); do
-            if nc -z 127.0.0.1 2222 2>/dev/null; then
-              break
-            fi
-            sleep 1
-          done
-
-          if ! nc -z 127.0.0.1 2222; then
+          if ! wait_for_port; then
             echo "Cloudflare proxy failed to start"
             cat /tmp/cloudflared.log
             exit 1
           fi
 
-          echo "Connecting to deployment server..."
-
-          ssh -vvv \
-            -i ~/.ssh/deploy_key \
-            -p 2222 \
-            -o StrictHostKeyChecking=yes \
-            -o ConnectTimeout=30 \
-            "$SSH_USER@127.0.0.1" \
-            "hostname"
-
-          cat /tmp/cloudflared.log
-
+          echo "Deploying..."
+          if ! ssh -i ~/.ssh/deploy_key \
+              -p 2222 \
+              -o StrictHostKeyChecking=yes \
+              -o ConnectTimeout=30 \
+              "$SSH_USER@127.0.0.1" 'bash -s' <<'REMOTE'
           set -Eeuo pipefail
+
+          export NVM_DIR="$HOME/.nvm"
+          . "$NVM_DIR/nvm.sh"
+          nvm use default >/dev/null
 
           APP_DIR="/media/hdd/projects/deploy"
           BRANCH="main"
           APP_NAME="deploy-app"
-
-          echo "================================"
-          echo "Starting deployment"
-          echo "================================"
-
-          cd "$APP_DIR"
+          export APP_NAME
 
           echo "Fetching latest source..."
+          cd "$APP_DIR"
           git fetch origin "$BRANCH"
-
-          echo "Updating working directory..."
           git reset --hard "origin/$BRANCH"
 
           echo "Installing production dependencies..."
           npm ci --omit=dev
 
-          echo "Checking PM2 process..."
-
+          echo "Restarting application..."
           if pm2 describe "$APP_NAME" >/dev/null 2>&1; then
-            echo "Restarting existing application..."
             pm2 restart "$APP_NAME" --update-env
           else
-            echo "Starting new application..."
             pm2 start server.js --name "$APP_NAME"
           fi
-
-          echo "Saving PM2 process list..."
           pm2 save
 
           echo "Verifying application status..."
-
           node -e '
             const apps = JSON.parse(require("child_process").execSync("pm2 jlist"));
-            const app = apps.find(p => p.name === "deploy-app");
-
+            const app = apps.find(p => p.name === process.env.APP_NAME);
             if (!app || app.pm2_env.status !== "online") {
               console.error("Deployment verification failed");
               process.exit(1);
             }
-
             console.log("Application status:", app.pm2_env.status);
           '
-
-          echo "================================"
-          echo "Deployment successful"
-          echo "================================"
-
           REMOTE
+          then
+            echo "===== cloudflared log ====="
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+
+          echo "Deployment successful"
