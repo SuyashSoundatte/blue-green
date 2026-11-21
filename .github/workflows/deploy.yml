@@ -33,9 +33,7 @@ jobs:
 
       - name: Check cloudflared version
         run: | 
-          cloudflared --version 
-          
-          cat /tmp/cloudflared.log    
+          cloudflared --version   
 
       - name: Configure SSH
         shell: bash
