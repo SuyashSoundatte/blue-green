@@ -31,6 +31,12 @@ jobs:
           chmod +x cloudflared
           sudo install cloudflared /usr/local/bin/cloudflared
 
+      - name: Check cloudflared version
+        run: | 
+          cloudflared --version 
+          
+          cat /tmp/cloudflared.log    
+
       - name: Configure SSH
         shell: bash
         env:
