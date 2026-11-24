@@ -15,6 +15,10 @@ app.get("/users", async (req, res) => {
   }
 });
 
+app.get("/ping", async (req, res) => {
+  return res.status(200).json({ success: true, message: "pong" });
+})
+
 app.post("/users", async (req, res) => {
   try {
     const { name, email } = req.body;
