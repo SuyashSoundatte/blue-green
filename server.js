@@ -15,9 +15,13 @@ app.get("/users", async (req, res) => {
   }
 });
 
-app.get("/ping", async (req, res) => {
-  return res.status(200).json({ success: true, message: "pong" });
-})
+app.get("/health", (req, res) => {
+    res.status(200).json({
+        status: "UP",
+        version: process.env.APP_VERSION || "unknown",
+        port: PORT
+    });
+});
 
 app.post("/users", async (req, res) => {
   try {
